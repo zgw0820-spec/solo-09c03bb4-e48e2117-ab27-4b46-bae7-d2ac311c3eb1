@@ -43,11 +43,47 @@ def test_index_and_presets_render(client):
     assert page.status_code == 200
     assert "门店结算测试调度台" in page.text
     assert "REF-001" in page.text
+    assert "试跑" in page.text  # REF-001 trial-run controls
 
     presets = test_client.get("/api/presets").json()["presets"]
     assert len(presets) == 9
     kinds = {p["kind"] for p in presets}
     assert kinds == {"audit", "refund"}
+
+
+def test_submit_trial_exit_via_http(client):
+    test_client, _ = client
+    response = test_client.post(
+        "/api/cases", json={"preset_id": "REF-001", "copies": 1, "trial": "exit"}
+    )
+    assert response.status_code == 202
+    accepted = response.json()["accepted"][0]
+    assert accepted["trial"] == "exit"
+    task_id = accepted["task_id"]
+
+    state = _wait(
+        test_client,
+        lambda s: any(t["task_id"] == task_id and t["status"] == "done" for t in s["tasks"]),
+        timeout=60,
+    )
+    task = next(t for t in state["tasks"] if t["task_id"] == task_id)
+    assert task["result"]["passed"] is True
+    assert task["result"]["output"]["stdout_bytes"] >= 8 * 1024 * 1024
+    assert task["result"]["output"]["buffer_peak_bytes"] <= 256 * 1024
+    assert task["restore"]["ok"] is True
+
+
+def test_submit_trial_rejected_for_other_presets(client):
+    test_client, _ = client
+    response = test_client.post("/api/cases", json={"preset_id": "AUD-001", "trial": "exit"})
+    assert response.status_code == 400
+    assert "仅支持" in response.json()["detail"]
+
+
+def test_submit_trial_invalid_mode_returns_422(client):
+    test_client, _ = client
+    response = test_client.post("/api/cases", json={"preset_id": "REF-001", "trial": "bogus"})
+    assert response.status_code == 422
 
 
 def test_submit_runs_case_and_reports_result(client):

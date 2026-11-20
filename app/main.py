@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -37,6 +38,10 @@ app = FastAPI(title="门店结算测试调度台", lifespan=lifespan)
 class SubmitRequest(BaseModel):
     preset_id: str = Field(min_length=1, max_length=64)
     copies: int = Field(default=1, ge=1, le=20)
+    # Trial run (REF-001 only): commit the refund, print the passing report,
+    # then flood stdout/stderr with >= 8 MiB each -- "exit" stops there,
+    # "timeout" keeps writing until the dispatcher kills the process.
+    trial: Literal["exit", "timeout"] | None = None
 
 
 class SimulateRequest(BaseModel):
@@ -65,11 +70,15 @@ async def get_state() -> dict:
 @app.post("/api/cases", status_code=202)
 async def submit_case(payload: SubmitRequest) -> dict:
     try:
-        tasks = await asyncio.to_thread(dispatcher.submit, payload.preset_id, payload.copies)
+        tasks = await asyncio.to_thread(
+            dispatcher.submit, payload.preset_id, payload.copies, payload.trial
+        )
     except UnknownPresetError:
         raise HTTPException(status_code=404, detail=f"未知预置用例: {payload.preset_id}")
     except QueueFullError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"accepted": tasks}
 
 

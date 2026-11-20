@@ -20,12 +20,32 @@
 
 - **每个用例一个进程**：`python -m app.worker --case AUD-001 --db /data/settlement.db`，
   stdout 输出一行 JSON 报告，退出码 0=通过 / 2=失败 / 其他=崩溃。
+- **输出收集有内存上限**：用例运行期间调度器持续读取 stdout/stderr，每项用例的
+  输出缓冲（报告槽 + 行拼装缓冲 + 两路尾部）合计封顶 256 KiB（`SETTLE_OUTPUT_BUFFER`），
+  完整日志不落盘，超出的旧字节从头部丢弃并计数。
+- **报告判定**：正常退出后按 stdout 中**最后一条**符合现有报告格式、`case_id` 匹配且
+  不超过 64 KiB（`SETTLE_REPORT_MAX`）的单行 JSON 报告判定；报告保存在独立槽位，
+  后续普通日志不会把它挤掉。缺少合格报告、退出码非零或超时都判失败。
+- **失败可见 stderr 尾部**：结果里保留 stderr 尾部（4 KiB），前文被丢弃时以
+  `…[已截断：丢弃前 N 字节]…` 标明。
+- **超时处理**：先 `SIGKILL` 整个进程组并回收子进程，再按原规则恢复退款库。
 - **只读契约由数据库强制**：核账进程连接后执行 `PRAGMA query_only = ON`，写操作会直接报错。
 - **恢复是原子的**：先复制到 `*.restore-stage` 并做 `PRAGMA integrity_check`，再 `rename` 覆盖，
   读取方不会看到写了一半的库。
 - **退款写在一个 `BEGIN IMMEDIATE` 事务里**，核账不会读到中间状态。
-- 子进程超时（默认 30s）会被 `SIGKILL` 整组结束后走恢复流程。
 - 服务启动时无条件把测试库恢复为起始快照（队列在内存中，重启即清空队列）。
+
+## REF-001 试跑
+
+调度页为 REF-001 提供两种**试跑**模式（也可 `POST /api/cases` 带 `"trial": "exit"|"timeout"`）：
+
+| 模式 | 行为 | 预期判定 |
+| --- | --- | --- |
+| `exit`（刷完正常退出） | 真实提交退款并输出通过报告后，向 stdout/stderr 各写 ≥8 MiB 普通日志，随后退出码 0 | 通过（报告在洪水中被保住） |
+| `timeout`（持续输出至超时） | 同上，但写满 8 MiB 后持续输出，直到调度器超时杀进程组 | 失败（超时），stderr 尾部带截断标记，数据库照常恢复 |
+
+两种模式都用于验证：报告不被后续日志挤掉、每用例输出缓冲封顶 256 KiB、日志不落盘、
+超时先杀进程组再恢复。网页结果行会显示判定、复位结果、两路输出字节数/丢弃量和缓冲峰值。
 
 ## 预置用例
 
@@ -58,7 +78,8 @@ docker compose up --build         # http://127.0.0.1:8000
 
 - 镜像基于 `python:3.12-slim`，以非 root 用户运行，内置 `HEALTHCHECK`。
 - 测试库与快照存放在命名卷 `settlement-data`（容器内 `/data`）。
-- 端口可用 `SETTLE_PORT` 覆盖；核账并发上限用 `SETTLE_MAX_AUDIT`。
+- 端口可用 `SETTLE_PORT` 覆盖；核账并发上限用 `SETTLE_MAX_AUDIT`；
+  输出缓冲/报告上限用 `SETTLE_OUTPUT_BUFFER` / `SETTLE_REPORT_MAX`（默认 256 KiB / 64 KiB）。
 
 ## HTTP 接口
 
@@ -67,7 +88,7 @@ docker compose up --build         # http://127.0.0.1:8000
 | GET | `/` | 调度台页面 |
 | GET | `/api/presets` | 预置用例列表 |
 | GET | `/api/state` | 队列、状态、结果、数据库摘要（网页每 0.9s 轮询） |
-| POST | `/api/cases` | `{"preset_id": "REF-001", "copies": 1}`，返回 202；未知用例 404；队列满 429 |
+| POST | `/api/cases` | `{"preset_id": "REF-001", "copies": 1}`，返回 202；未知用例 404；队列满 429；REF-001 可带 `"trial": "exit"\|"timeout"` 试跑，其他用例带试跑 400 |
 | POST | `/api/restore/simulate-failure` | `{"count": 1}` 装填模拟恢复失败 |
 | POST | `/api/restore/retry` | 重试恢复；无待恢复项时 409 |
 | GET | `/api/db/fingerprint` | 只读查看测试库全部数据，便于人工核对 |
@@ -82,7 +103,9 @@ PYTHONPATH=. python3 -m pytest tests -q
 覆盖：四项核账通过且不改库、退款成功/失败后均恢复、崩溃提交后仍恢复、
 核账不越过排队退款、退款等待运行中核账、核账并发恰为 2、恢复失败暂停/拒派发/重试续跑、
 重试再失败仍暂停、超时杀进程后恢复、重启恢复起始状态、核账写库被数据库层拒绝、
-HTTP 层 404/409/暂停暂停期间提交、页面渲染。
+HTTP 层 404/409/暂停暂停期间提交、页面渲染，
+以及输出收集器（256 KiB 上限、报告槽保护、64 KiB 报告边界、截断标记）
+与 REF-001 试跑两种退出场景（正常退出判通过、持续输出至超时判失败并恢复）。
 
 ## 已知限制
 

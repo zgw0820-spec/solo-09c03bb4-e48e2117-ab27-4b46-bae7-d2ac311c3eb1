@@ -296,6 +296,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--case", required=True)
     parser.add_argument("--db", required=True)
     parser.add_argument("--hold-ms", type=int, default=0)
+    parser.add_argument(
+        "--flood",
+        choices=("off", "exit", "timeout"),
+        default="off",
+        help="after printing the report, write at least --flood-mib MiB of ordinary "
+        "logs to stdout AND stderr; 'exit' then returns normally, 'timeout' keeps "
+        "writing until the dispatcher kills the process",
+    )
+    parser.add_argument("--flood-mib", type=int, default=8)
     args = parser.parse_args(argv)
 
     passed, message, details = run_case(args.case, Path(args.db), hold_ms=args.hold_ms)
@@ -306,7 +315,58 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     sys.stdout.flush()
+    if args.flood != "off":
+        _flood_streams(args.flood, args.flood_mib)
     return 0 if passed else 2
+
+
+def _flood_streams(mode: str, min_mib: int) -> None:
+    """Write ordinary (non-report) log lines to stdout and stderr.
+
+    Both streams receive at least ``min_mib`` MiB.  ``exit`` returns once the
+    minimum is reached; ``timeout`` keeps writing until the dispatcher kills
+    the process.  Lines are plain text so they can never be mistaken for the
+    JSON report, and the stream is flushed regularly so the dispatcher sees a
+    continuous flow.
+    """
+    min_bytes = max(1, min_mib) * 1024 * 1024
+    out = sys.stdout.buffer
+    err = sys.stderr.buffer
+    pad = "0123456789abcdef" * 62  # 992 chars -> roughly 1 KiB per line
+    sent = {"stdout": 0, "stderr": 0}
+    seq = 0
+
+    def line(stream_name: str) -> bytes:
+        return f"[flood] stream={stream_name} seq={seq:08d} {pad}\n".encode("ascii")
+
+    try:
+        while sent["stdout"] < min_bytes or sent["stderr"] < min_bytes:
+            if sent["stdout"] < min_bytes:
+                chunk = line("stdout")
+                out.write(chunk)
+                sent["stdout"] += len(chunk)
+            if sent["stderr"] < min_bytes:
+                chunk = line("stderr")
+                err.write(chunk)
+                sent["stderr"] += len(chunk)
+            seq += 1
+            if seq % 64 == 0:
+                out.flush()
+                err.flush()
+        out.flush()
+        err.flush()
+        while mode == "timeout":
+            chunk = line("stdout")
+            out.write(chunk)
+            chunk = line("stderr")
+            err.write(chunk)
+            seq += 1
+            if seq % 64 == 0:
+                out.flush()
+                err.flush()
+    except BrokenPipeError:
+        # The dispatcher went away; nothing left to log to.
+        return
 
 
 if __name__ == "__main__":

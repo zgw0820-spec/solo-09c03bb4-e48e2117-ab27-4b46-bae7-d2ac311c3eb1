@@ -32,10 +32,20 @@ from typing import Any, Literal
 from app.cases import PRESETS_BY_ID, CaseDefinition
 from app.config import Settings
 from app.db import SeedManager
+from app.output import CaseOutputCollector
 
 Status = Literal["queued", "running", "restoring", "done", "blocked_restore"]
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Trial runs of REF-001 commit the refund, print the passing report and then
+# flood both streams with at least 8 MiB of logs -- either exiting normally
+# ("exit") or keeping it up until the dispatcher kills them ("timeout").
+TRIAL_PRESET_ID = "REF-001"
+TRIAL_MODES = ("exit", "timeout")
+
+# How much of the stderr tail is kept in the task result for the web UI.
+STDERR_TAIL_RESULT_BYTES = 4096
 
 
 class QueueFullError(Exception):
@@ -53,6 +63,7 @@ class Task:
     name: str
     kind: str
     expectation: str
+    trial: str | None = None
     status: Status = "queued"
     submitted_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -70,6 +81,7 @@ class Task:
             "name": self.name,
             "kind": self.kind,
             "expectation": self.expectation,
+            "trial": self.trial,
             "status": self.status,
             "submitted_at": self.submitted_at,
             "started_at": self.started_at,
@@ -133,10 +145,17 @@ class Dispatcher:
 
     # -- public API --------------------------------------------------------
 
-    def submit(self, preset_id: str, copies: int = 1) -> list[dict[str, Any]]:
+    def submit(
+        self, preset_id: str, copies: int = 1, trial: str | None = None
+    ) -> list[dict[str, Any]]:
         definition = PRESETS_BY_ID.get(preset_id)
         if definition is None:
             raise UnknownPresetError(preset_id)
+        if trial is not None:
+            if trial not in TRIAL_MODES:
+                raise ValueError(f"未知试跑模式: {trial}（可选 {', '.join(TRIAL_MODES)}）")
+            if preset_id != TRIAL_PRESET_ID:
+                raise ValueError(f"试跑模式仅支持 {TRIAL_PRESET_ID}")
         copies = max(1, min(int(copies), 20))
         with self._cond:
             queued = sum(1 for tid in self._queue if self._tasks[tid].status == "queued")
@@ -144,7 +163,7 @@ class Dispatcher:
                 raise QueueFullError(f"队列已满（上限 {self.settings.max_queue_size}）")
             created: list[Task] = []
             for _ in range(copies):
-                task = self._new_task(definition)
+                task = self._new_task(definition, trial)
                 self._tasks[task.task_id] = task
                 self._order.append(task.task_id)
                 self._queue.append(task.task_id)
@@ -242,13 +261,14 @@ class Dispatcher:
 
     # -- scheduler ---------------------------------------------------------
 
-    def _new_task(self, definition: CaseDefinition) -> Task:
+    def _new_task(self, definition: CaseDefinition, trial: str | None = None) -> Task:
         return Task(
             task_id=uuid.uuid4().hex,
             preset_id=definition.preset_id,
             name=definition.name,
             kind=definition.kind,
             expectation=definition.expectation,
+            trial=trial,
         )
 
     def _prune_history_locked(self) -> None:
@@ -307,8 +327,8 @@ class Dispatcher:
 
     # -- execution ---------------------------------------------------------
 
-    def _worker_command(self, preset_id: str) -> list[str]:
-        return [
+    def _worker_command(self, preset_id: str, trial: str | None = None) -> list[str]:
+        command = [
             sys.executable,
             "-m",
             "app.worker",
@@ -316,11 +336,14 @@ class Dispatcher:
             preset_id,
             "--db",
             str(self.settings.db_path),
-            *self.extra_worker_args,
         ]
+        if trial:
+            command += ["--flood", trial]
+        command += self.extra_worker_args
+        return command
 
     def _run_child(self, preset_id: str, task: Task | None = None) -> dict[str, Any]:
-        command = self._worker_command(preset_id)
+        command = self._worker_command(preset_id, task.trial if task else None)
         started = time.monotonic()
         env = dict(os.environ)
         env.setdefault("PYTHONUNBUFFERED", "1")
@@ -334,7 +357,7 @@ class Dispatcher:
                 cwd=str(PROJECT_ROOT),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                bufsize=0,  # unbuffered binary pipes: readers see output as it comes
                 env=env,
                 start_new_session=True,
             )
@@ -348,68 +371,134 @@ class Dispatcher:
                 "duration_ms": int((time.monotonic() - started) * 1000),
                 "command": display,
                 "pid": None,
+                "output": None,
+                "stderr_tail": "",
             }
 
         if task is not None:
             with self._cond:
                 task.pid = process.pid
 
+        # Drain both streams continuously into a bounded in-memory collector;
+        # full logs are never written to disk and retained output stays within
+        # the configured per-case budget no matter how much the case prints.
+        collector = CaseOutputCollector(
+            preset_id,
+            total_cap=self.settings.output_buffer_bytes,
+            report_cap=self.settings.report_max_bytes,
+        )
+        readers = [
+            threading.Thread(
+                target=self._drain_stream,
+                args=(process.stdout, "stdout", collector),
+                name=f"settlement-stdout-{process.pid}",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._drain_stream,
+                args=(process.stderr, "stderr", collector),
+                name=f"settlement-stderr-{process.pid}",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
         timed_out = False
         try:
-            stdout, stderr = process.communicate(timeout=self.settings.child_timeout_seconds)
+            process.wait(timeout=self.settings.child_timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
+            # Kill the whole process group first, then reap the child before
+            # the caller moves on to the database restore step.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            stdout, stderr = process.communicate()
+            process.wait()
+        for reader in readers:
+            reader.join(timeout=5)
+        collector.finalize()
         duration_ms = int((time.monotonic() - started) * 1000)
         return self._parse_child_output(
-            preset_id, process.pid, process.returncode, stdout, stderr, timed_out, duration_ms, display
+            preset_id,
+            process.pid,
+            process.returncode,
+            collector,
+            timed_out,
+            duration_ms,
+            display,
         )
+
+    @staticmethod
+    def _drain_stream(stream, name: str, collector: CaseOutputCollector) -> None:
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    return
+                collector.feed(name, chunk)
+        except (OSError, ValueError):
+            return
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
     def _parse_child_output(
         self,
         preset_id: str,
         pid: int | None,
         exit_code: int | None,
-        stdout: str,
-        stderr: str,
+        collector: CaseOutputCollector,
         timed_out: bool,
         duration_ms: int,
         command: str,
     ) -> dict[str, Any]:
+        output_stats = collector.stats()
+        stderr_tail = collector.tail_text("stderr", STDERR_TAIL_RESULT_BYTES)
+        stderr_excerpt = stderr_tail.strip()[-800:]
+        if stderr_excerpt and output_stats["stderr_dropped_bytes"]:
+            stderr_excerpt = "…" + stderr_excerpt
+
         report: dict[str, Any] | None = None
-        for line in reversed(stdout.splitlines()):
-            line = line.strip()
-            if not line:
-                continue
+        report_line = collector.report_line
+        if report_line is not None:
             try:
-                candidate = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(candidate, dict) and candidate.get("case_id") == preset_id:
+                candidate = json.loads(report_line)
+            except ValueError:
+                candidate = None
+            if isinstance(candidate, dict):
                 report = candidate
-                break
-        if report is None:
+
+        base: dict[str, Any] = {
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "duration_ms": duration_ms,
+            "command": command,
+            "pid": pid,
+            "output": output_stats,
+            "stderr_tail": stderr_tail,
+        }
+
+        if timed_out:
             message = (
-                f"用例进程超时（>{self.settings.child_timeout_seconds}s），已强制结束"
-                if timed_out
-                else f"用例进程未返回结果（exit={exit_code}）"
+                f"用例进程超时（>{self.settings.child_timeout_seconds}s），"
+                "已终止进程组并回收子进程"
             )
-            if stderr.strip():
-                message += f"；stderr: {stderr.strip()[-800:]}"
-            return {
-                "passed": False,
-                "message": message,
-                "details": {},
-                "exit_code": exit_code,
-                "timed_out": timed_out,
-                "duration_ms": duration_ms,
-                "command": command,
-                "pid": pid,
-            }
+            if report is not None:
+                message += "；超时前输出的报告不予采信"
+            if stderr_excerpt:
+                message += f"；stderr 尾部: {stderr_excerpt}"
+            return {"passed": False, "message": message, "details": {}, **base}
+
+        if report is None:
+            message = f"用例进程未返回合格报告（exit={exit_code}）"
+            if stderr_excerpt:
+                message += f"；stderr 尾部: {stderr_excerpt}"
+            return {"passed": False, "message": message, "details": {}, **base}
+
         passed = bool(report.get("passed"))
         message = report.get("message", "")
         if passed and exit_code not in (0, None):
@@ -420,11 +509,7 @@ class Dispatcher:
             "passed": passed,
             "message": message,
             "details": report.get("details", {}),
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "duration_ms": duration_ms,
-            "command": command,
-            "pid": pid,
+            **base,
         }
 
     def _run_audit(self, task_id: str) -> None:

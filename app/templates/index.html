@@ -49,6 +49,8 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   input[type=number] { width: 62px; background: #0e1830; color: var(--text);
     border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: inherit; }
+  select { background: #0e1830; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 12px; }
   .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
     gap: 10px; margin-bottom: 14px; }
   .kpi { background: #101a2e; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
@@ -121,6 +123,16 @@
             <input type="number" min="1" max="20" value="1" aria-label="份数">
             <button class="submit" data-preset="{{ p.preset_id }}">提交</button>
           </div>
+          {% if p.preset_id == "REF-001" %}
+          <div class="meta trial-row">
+            <span class="touches">试跑：真实提交退款并输出通过报告后，向 stdout/stderr 各写 ≥8 MiB 日志（报告须保住，日志缓冲封顶 256 KiB）</span>
+            <select class="trial-mode" aria-label="试跑模式">
+              <option value="exit">试跑·刷完正常退出</option>
+              <option value="timeout">试跑·持续输出至超时</option>
+            </select>
+            <button class="trial" data-preset="{{ p.preset_id }}">试跑</button>
+          </div>
+          {% endif %}
         </div>
         {% endfor %}
       </div>
@@ -190,6 +202,15 @@ function fmtDuration(ms) {
   return ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
 }
 
+function fmtBytes(n) {
+  if (n === null || n === undefined) return "-";
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MiB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KiB";
+  return n + " B";
+}
+
+const TRIAL_TEXT = { exit: "试跑·正常退出", timeout: "试跑·持续输出至超时" };
+
 function statusBadge(task) {
   let cls = task.status;
   if (task.status === "done" && task.result && !task.result.passed) cls = "failed";
@@ -214,6 +235,16 @@ function resultCell(task) {
     parts.push(`<div class="msg ${cls}">${escapeHTML(task.result.message || "")}</div>`);
     if (task.result.details && Object.keys(task.result.details).length) {
       parts.push(`<details><summary>详情</summary><pre>${escapeHTML(JSON.stringify(task.result.details, null, 2))}</pre></details>`);
+    }
+    if (task.result.output) {
+      const o = task.result.output;
+      const drop = (d) => d > 0 ? `，截断丢弃 ${fmtBytes(d)}` : "";
+      parts.push(`<div class="restore-line">输出 stdout ${fmtBytes(o.stdout_bytes)}${drop(o.stdout_dropped_bytes)}`
+        + ` · stderr ${fmtBytes(o.stderr_bytes)}${drop(o.stderr_dropped_bytes)}`
+        + ` · 缓冲峰值 ${fmtBytes(o.buffer_peak_bytes)}/${fmtBytes(o.buffer_cap_bytes)}（不落盘）</div>`);
+    }
+    if (task.result.stderr_tail) {
+      parts.push(`<details><summary>stderr 尾部</summary><pre>${escapeHTML(task.result.stderr_tail)}</pre></details>`);
     }
   }
   if (task.error && !(task.result && task.result.message)) {
@@ -284,7 +315,7 @@ function render(state) {
     return `<tr>
       <td class="num">${state.tasks.length - idx}</td>
       <td>${escapeHTML(task.preset_id)}<br><span class="restore-line">${escapeHTML(task.name)}</span></td>
-      <td>${statusBadge(task)}<br><span class="restore-line">${KIND_TEXT[task.kind] || task.kind}${task.expectation === "failure" ? " · 预期失败" : ""}</span></td>
+      <td>${statusBadge(task)}<br><span class="restore-line">${KIND_TEXT[task.kind] || task.kind}${task.trial ? " · " + (TRIAL_TEXT[task.trial] || "试跑") : ""}${task.expectation === "failure" ? " · 预期失败" : ""}</span></td>
       <td>${resultCell(task)}</td>
       <td class="num">${fmtDuration(task.duration_ms)}</td>
       <td class="num">${pid}</td>
@@ -317,6 +348,26 @@ document.addEventListener("click", async (event) => {
       toast(`提交失败：${err.message}`, true);
     } finally {
       btn.disabled = false;
+      poll();
+    }
+    return;
+  }
+  const trialBtn = event.target.closest("button.trial");
+  if (trialBtn) {
+    const wrap = trialBtn.closest(".preset");
+    const mode = wrap.querySelector("select.trial-mode").value;
+    trialBtn.disabled = true;
+    try {
+      const data = await postJSON("/api/cases", {
+        preset_id: trialBtn.dataset.preset,
+        copies: 1,
+        trial: mode,
+      });
+      toast(`已接收试跑（${trialBtn.dataset.preset} · ${TRIAL_TEXT[mode] || mode}）`);
+    } catch (err) {
+      toast(`试跑提交失败：${err.message}`, true);
+    } finally {
+      trialBtn.disabled = false;
       poll();
     }
   }
